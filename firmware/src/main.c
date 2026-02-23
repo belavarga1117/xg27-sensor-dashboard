@@ -6,6 +6,8 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/sys/printk.h>
 
+#define FW_VERSION "1.0.0"
+
 /* Sensors */
 static const struct device *const si7021   = DEVICE_DT_GET(DT_NODELABEL(si7021));
 static const struct device *const veml6035 = DEVICE_DT_GET(DT_NODELABEL(veml6035));
