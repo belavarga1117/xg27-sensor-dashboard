@@ -1,169 +1,200 @@
 #!/usr/bin/env python3
 """
 xG27 Sensor Dashboard Server
-- BLE scan-eli az xG27 Dev Kit advertising adatát (bleak)
-- HTTP + SSE szerver iPhone/böngésző számára (port 5555)
+
+- Scans for xG27-Sensor BLE advertisements (bleak)
+- Serves a real-time HTML dashboard over HTTP/SSE on port 5555
+- Auto-reconnects BLE on failure
 """
 
 import asyncio
 import json
+import logging
+import pathlib
+import queue
 import struct
 import subprocess
 import threading
-import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from typing import Any
+
 from bleak import BleakScanner
 
-PORT        = 5555
-HTML_FILE   = '/Users/vargabela/sensor.html'
-DEVICE_NAME = 'xG27-Sensor'
-COMPANY_ID  = 0xFFFF          # teszt company id
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-latest     = {}
-sse_clients = []
-sse_lock    = threading.Lock()
+PORT             = 5555
+HTML_FILE        = pathlib.Path(__file__).parent / "sensor.html"
+DEVICE_NAME      = "xG27-Sensor"
+COMPANY_ID       = 0xFFFF
+BLE_RETRY_DELAY  = 5    # seconds between reconnect attempts
+SSE_HEARTBEAT    = 15   # seconds between keep-alive comments
+
+latest: dict[str, Any] = {}
+_clients: list[queue.SimpleQueue[str]] = []
+_clients_lock = threading.Lock()
 
 
-def get_wifi_ip():
+def _wifi_ip() -> str:
     try:
-        r = subprocess.run(['ipconfig', 'getifaddr', 'en0'],
-                           capture_output=True, text=True)
-        ip = r.stdout.strip()
-        return ip if ip else 'localhost'
+        r = subprocess.run(
+            ["ipconfig", "getifaddr", "en0"], capture_output=True, text=True
+        )
+        return r.stdout.strip() or "localhost"
     except Exception:
-        return 'localhost'
+        return "localhost"
 
 
-def push_to_clients(data_str):
-    with sse_lock:
-        dead = []
-        for q in sse_clients:
-            try:
-                q.append(data_str)
-            except Exception:
-                dead.append(q)
-        for q in dead:
-            sse_clients.remove(q)
+def _broadcast(payload: str) -> None:
+    with _clients_lock:
+        for q in _clients:
+            q.put_nowait(payload)
 
 
-def parse_mfr(raw: bytes):
-    """Parse 7-byte manufacturer payload: temp(2) hum(1) lux(2) mag(2)"""
-    if len(raw) < 7:
+def _parse(raw: bytes) -> dict[str, Any] | None:
+    """Parse the 8-byte BLE manufacturer payload (company ID already stripped).
+
+    Layout:
+      [0–1]  int16 LE   temperature (centi-°C)
+      [2]    uint8      humidity (%RH)
+      [3–4]  uint16 LE  ambient light (lux)
+      [5–6]  int16 LE   magnetic field (µT)
+      [7]    uint8      sensor flags  bit0=temp/hum  bit1=lux  bit2=mag
+    """
+    if len(raw) < 8:
         return None
-    temp_cdeg = struct.unpack_from('<h', raw, 0)[0]
+    temp_cdeg = struct.unpack_from("<h", raw, 0)[0]
     hum       = raw[2]
-    lux       = struct.unpack_from('<H', raw, 3)[0]
-    mag       = struct.unpack_from('<h', raw, 5)[0]
+    lux       = struct.unpack_from("<H", raw, 3)[0]
+    mag       = struct.unpack_from("<h", raw, 5)[0]
+    flags     = raw[7]
     return {
-        't': round(temp_cdeg / 100.0, 2),
-        'h': int(hum),
-        'l': int(lux),
-        'm': float(mag),
-        'f': 7,
+        "t": round(temp_cdeg / 100.0, 2),
+        "h": int(hum),
+        "l": int(lux),
+        "m": float(mag),
+        "f": int(flags),
     }
 
 
-# ── BLE scanner ───────────────────────────────────────────────────────────────
+# ── BLE ───────────────────────────────────────────────────────────────────────
 
-async def ble_scan():
-    print(f"BLE scan indul — '{DEVICE_NAME}' keresése...")
+async def _ble_scan() -> None:
+    log.info("BLE scan started — looking for '%s'", DEVICE_NAME)
 
-    def callback(device, adv):
+    def on_adv(device, adv):
         if device.name != DEVICE_NAME:
             return
-        raw = adv.manufacturer_data.get(COMPANY_ID, b'')
-        data = parse_mfr(raw)
-        if data:
-            global latest
-            latest = data
-            print(f"[BLE] t={data['t']}°C h={data['h']}% "
-                  f"l={data['l']}lux m={data['m']}µT")
-            push_to_clients(json.dumps(data))
+        raw = adv.manufacturer_data.get(COMPANY_ID, b"")
+        data = _parse(raw)
+        if data is None:
+            return
+        global latest
+        latest = data
+        log.info(
+            "t=%.2f°C  h=%d%%  l=%d lux  m=%.1f µT  f=%d",
+            data["t"], data["h"], data["l"], data["m"], data["f"],
+        )
+        _broadcast(json.dumps(data))
 
-    async with BleakScanner(callback):
+    async with BleakScanner(on_adv):
         await asyncio.Future()
 
 
-# ── HTTP / SSE server ─────────────────────────────────────────────────────────
+async def ble_loop() -> None:
+    while True:
+        try:
+            await _ble_scan()
+        except Exception as exc:
+            log.error("BLE error: %s — retry in %ds", exc, BLE_RETRY_DELAY)
+            await asyncio.sleep(BLE_RETRY_DELAY)
 
-class Handler(BaseHTTPRequestHandler):
+
+# ── HTTP / SSE ────────────────────────────────────────────────────────────────
+
+class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        pass
+        pass  # silence per-request access log
 
     def do_GET(self):
-        if self.path in ('/', '/sensor.html'):
-            try:
-                with open(HTML_FILE, 'rb') as f:
-                    body = f.read()
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.send_header('Content-Length', len(body))
-                self.end_headers()
-                self.wfile.write(body)
-            except FileNotFoundError:
-                self.send_error(404)
-
-        elif self.path == '/events':
-            self.send_response(200)
-            self.send_header('Content-Type',  'text/event-stream')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection',    'keep-alive')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-
-            q = []
-            with sse_lock:
-                sse_clients.append(q)
-
-            if latest:
-                try:
-                    self.wfile.write(f"data: {json.dumps(latest)}\n\n".encode())
-                    self.wfile.flush()
-                except Exception:
-                    pass
-
-            try:
-                while True:
-                    if q:
-                        msg = q.pop(0)
-                        self.wfile.write(f"data: {msg}\n\n".encode())
-                        self.wfile.flush()
-                    else:
-                        time.sleep(0.1)
-            except Exception:
-                pass
-            finally:
-                with sse_lock:
-                    if q in sse_clients:
-                        sse_clients.remove(q)
+        if self.path in ("/", "/sensor.html"):
+            self._serve_html()
+        elif self.path == "/events":
+            self._serve_sse()
         else:
             self.send_error(404)
 
+    def _serve_html(self):
+        try:
+            body = HTML_FILE.read_bytes()
+        except FileNotFoundError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-class ReuseServer(ThreadingMixIn, HTTPServer):
+    def _serve_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type",  "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection",    "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        q: queue.SimpleQueue[str] = queue.SimpleQueue()
+        with _clients_lock:
+            _clients.append(q)
+
+        if latest:
+            try:
+                self.wfile.write(f"data: {json.dumps(latest)}\n\n".encode())
+                self.wfile.flush()
+            except Exception:
+                pass
+
+        try:
+            while True:
+                try:
+                    msg = q.get(timeout=SSE_HEARTBEAT)
+                    line = f"data: {msg}\n\n"
+                except queue.Empty:
+                    line = ": heartbeat\n\n"  # prevent proxy / browser timeout
+                self.wfile.write(line.encode())
+                self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            with _clients_lock:
+                try:
+                    _clients.remove(q)
+                except ValueError:
+                    pass
+
+
+class _Server(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
 
-def start_http():
-    server = ReuseServer(('', PORT), Handler)
-    server.serve_forever()
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    ip = _wifi_ip()
+    log.info("Dashboard (Mac):    http://localhost:%d/", PORT)
+    log.info("Dashboard (iPhone): http://%s:%d/", ip, PORT)
+
+    threading.Thread(target=lambda: _Server(("", PORT), _Handler).serve_forever(),
+                     daemon=True).start()
+    await ble_loop()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-async def main():
-    ip = get_wifi_ip()
-    print(f"Dashboard (Mac):    http://localhost:{PORT}/")
-    print(f"Dashboard (iPhone): http://{ip}:{PORT}/")
-    print()
-
-    t = threading.Thread(target=start_http, daemon=True)
-    t.start()
-
-    await ble_scan()
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
