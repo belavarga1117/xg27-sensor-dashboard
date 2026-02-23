@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xG27 Sensor Monitor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: #0f1117;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 32px;
+  }
+  header h1 { font-size: 1.8rem; color: #fff; letter-spacing: 1px; }
+  header p  { font-size: 0.85rem; color: #666; margin-top: 4px; }
+
+  #status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.8rem;
+    padding: 4px 12px;
+    border-radius: 20px;
+    margin-top: 10px;
+    background: #1e1e2e;
+    border: 1px solid #333;
+  }
+  #status .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #444;
+    transition: background 0.4s;
+  }
+  #status.connected   .dot { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+  #status.disconnected .dot { background: #ef4444; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 20px;
+    width: 100%;
+    max-width: 900px;
+  }
+
+  .card {
+    background: #1a1a2e;
+    border: 1px solid #2a2a3e;
+    border-radius: 16px;
+    padding: 28px 24px 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    transition: border-color 0.3s;
+    position: relative;
+    overflow: hidden;
+  }
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: var(--accent, #3b82f6);
+    border-radius: 16px 16px 0 0;
+  }
+  .card:hover { border-color: var(--accent, #3b82f6); }
+
+  .card .icon { font-size: 2.2rem; }
+  .card .label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: #888;
+  }
+  .card .value {
+    font-size: 2.8rem;
+    font-weight: 700;
+    color: #fff;
+    transition: color 0.3s;
+    font-variant-numeric: tabular-nums;
+  }
+  .card .unit {
+    font-size: 1rem;
+    color: #888;
+    font-weight: 400;
+  }
+  .card .na { font-size: 1.5rem; color: #444; }
+
+  .card.updated .value { color: var(--accent, #3b82f6); }
+
+  .card-temp  { --accent: #f97316; }
+  .card-hum   { --accent: #3b82f6; }
+  .card-light { --accent: #eab308; }
+  .card-mag   { --accent: #a855f7; }
+
+  /* Bar indicator */
+  .bar-track {
+    width: 100%;
+    height: 6px;
+    background: #2a2a3e;
+    border-radius: 3px;
+    margin-top: 4px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--accent, #3b82f6);
+    transition: width 0.6s ease;
+    width: 0%;
+  }
+
+  /* History chart */
+  .chart-wrap {
+    width: 100%;
+    max-width: 900px;
+    margin-top: 28px;
+    background: #1a1a2e;
+    border: 1px solid #2a2a3e;
+    border-radius: 16px;
+    padding: 20px;
+  }
+  .chart-wrap h2 {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #888;
+    margin-bottom: 12px;
+  }
+  canvas { width: 100% !important; height: 160px; display: block; }
+
+  footer {
+    margin-top: 32px;
+    font-size: 0.75rem;
+    color: #444;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>xG27 Sensor Monitor</h1>
+  <p>Silicon Labs EFR32BG27 Dev Kit</p>
+  <div id="status" class="disconnected">
+    <span class="dot"></span>
+    <span id="status-text">Kapcsolódás...</span>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="card card-temp" id="card-temp">
+    <div class="icon">🌡️</div>
+    <div class="label">Hőmérséklet</div>
+    <div class="value" id="val-temp"><span class="na">—</span></div>
+    <div class="unit">°C</div>
+    <div class="bar-track"><div class="bar-fill" id="bar-temp"></div></div>
+  </div>
+
+  <div class="card card-hum" id="card-hum">
+    <div class="icon">💧</div>
+    <div class="label">Páratartalom</div>
+    <div class="value" id="val-hum"><span class="na">—</span></div>
+    <div class="unit">% RH</div>
+    <div class="bar-track"><div class="bar-fill" id="bar-hum"></div></div>
+  </div>
+
+  <div class="card card-light" id="card-light">
+    <div class="icon">☀️</div>
+    <div class="label">Fény</div>
+    <div class="value" id="val-lux"><span class="na">—</span></div>
+    <div class="unit">lux</div>
+    <div class="bar-track"><div class="bar-fill" id="bar-lux"></div></div>
+  </div>
+
+  <div class="card card-mag" id="card-mag">
+    <div class="icon">🧲</div>
+    <div class="label">Mágneses tér</div>
+    <div class="value" id="val-mag"><span class="na">—</span></div>
+    <div class="unit">µT</div>
+    <div class="bar-track"><div class="bar-fill" id="bar-mag"></div></div>
+  </div>
+</div>
+
+<div class="chart-wrap">
+  <h2>Hőmérséklet előzmény (utolsó 60 mp)</h2>
+  <canvas id="chart"></canvas>
+</div>
+
+<footer>xG27 Dev Kit · Zephyr RTOS · WebSocket frissítés</footer>
+
+<script>
+const SSE_URL = '/events';
+const MAX_HISTORY = 60;
+const tempHistory = [];
+
+let es;
+const statusEl  = document.getElementById('status');
+const statusTxt = document.getElementById('status-text');
+
+function connect() {
+  statusEl.className = 'disconnected';
+  statusTxt.textContent = 'Kapcsolódás...';
+
+  es = new EventSource(SSE_URL);
+
+  es.onopen = () => {
+    statusEl.className = 'connected';
+    statusTxt.textContent = 'Kapcsolódva';
+  };
+
+  es.onerror = () => {
+    statusEl.className = 'disconnected';
+    statusTxt.textContent = 'Kapcsolat megszakadt — újrapróbálás...';
+    es.close();
+    setTimeout(connect, 3000);
+  };
+
+  es.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      update(d);
+    } catch {}
+  };
+}
+
+function flash(cardId) {
+  const card = document.getElementById(cardId);
+  card.classList.add('updated');
+  setTimeout(() => card.classList.remove('updated'), 600);
+}
+
+function setVal(id, text, barId, pct) {
+  document.getElementById(id).textContent = text;
+  if (barId) {
+    document.getElementById(barId).style.width = Math.min(100, Math.max(0, pct)) + '%';
+  }
+}
+
+function update(d) {
+  const hasTemp = d.f & 1;
+  const hasLux  = d.f & 2;
+  const hasMag  = d.f & 4;
+
+  if (hasTemp) {
+    setVal('val-temp', d.t.toFixed(2), 'bar-temp', (d.t - 10) / 40 * 100);
+    setVal('val-hum',  d.h, 'bar-hum', d.h);
+    flash('card-temp');
+    flash('card-hum');
+    tempHistory.push(d.t);
+    if (tempHistory.length > MAX_HISTORY) tempHistory.shift();
+    drawChart();
+  }
+
+  if (hasLux) {
+    setVal('val-lux', d.l, 'bar-lux', Math.log10(Math.max(1, d.l)) / 5 * 100);
+    flash('card-light');
+  }
+
+  if (hasMag) {
+    setVal('val-mag', d.m.toFixed(2), 'bar-mag', (d.m + 200) / 400 * 100);
+    flash('card-mag');
+  } else {
+    document.getElementById('val-mag').innerHTML = '<span class="na">N/A</span>';
+  }
+}
+
+// ── Simple canvas chart ───────────────────────────────────────────────────
+
+const canvas = document.getElementById('chart');
+const ctx    = canvas.getContext('2d');
+
+function drawChart() {
+  const w = canvas.offsetWidth;
+  const h = canvas.offsetHeight || 160;
+  canvas.width  = w;
+  canvas.height = h;
+
+  if (tempHistory.length < 2) return;
+
+  const min = Math.min(...tempHistory) - 1;
+  const max = Math.max(...tempHistory) + 1;
+  const pad = { l: 40, r: 10, t: 10, b: 20 };
+  const gw  = w - pad.l - pad.r;
+  const gh  = h - pad.t - pad.b;
+
+  ctx.clearRect(0, 0, w, h);
+
+  // Grid lines
+  ctx.strokeStyle = '#2a2a3e';
+  ctx.lineWidth   = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + gh * i / 4;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(w - pad.r, y);
+    ctx.stroke();
+    const label = (max - (max - min) * i / 4).toFixed(1);
+    ctx.fillStyle = '#666';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(label, pad.l - 4, y + 4);
+  }
+
+  // Temperature line
+  ctx.beginPath();
+  ctx.strokeStyle = '#f97316';
+  ctx.lineWidth   = 2;
+  ctx.lineJoin    = 'round';
+  tempHistory.forEach((v, i) => {
+    const x = pad.l + gw * i / (MAX_HISTORY - 1);
+    const y = pad.t + gh * (1 - (v - min) / (max - min));
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // Fill under line
+  const lastX = pad.l + gw * (tempHistory.length - 1) / (MAX_HISTORY - 1);
+  ctx.lineTo(lastX, h - pad.b);
+  ctx.lineTo(pad.l, h - pad.b);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, pad.t, 0, h - pad.b);
+  grad.addColorStop(0, 'rgba(249,115,22,0.25)');
+  grad.addColorStop(1, 'rgba(249,115,22,0)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+}
+
+window.addEventListener('resize', drawChart);
+connect();
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+/* DTS overlay for xG27 Dev Kit — missing sensor nodes */
+
+/* Enable IMU power rail (might power Si7210 too) */
+&sw_imu_enable {
+	regulator-always-on;
+};
+
+&i2c0 {
+	si7210: si7210@30 {
+		status = "okay";
+	};
+
+	si7021: si7021@40 {
+		compatible = "silabs,si7006";
+		reg = <0x40>;
+	};
+
+	veml6035: veml6035@29 {
+		compatible = "vishay,veml7700";
+		reg = <0x29>;
+	};
+};

@@ -1,0 +1,21 @@
+diff --git a/drivers/sensor/silabs/si7210/si7210.c b/drivers/sensor/silabs/si7210/si7210.c
+index 1139d210826..03a3feeff76 100644
+--- a/drivers/sensor/silabs/si7210/si7210.c
++++ b/drivers/sensor/silabs/si7210/si7210.c
+@@ -150,7 +150,16 @@ static int si7210_wakeup(const struct device *dev)
+ 	 * Read one byte from the chip to wake it up. The shorter alternative
+ 	 * is to write a zero byte length message, but it might not be
+ 	 * supported by all I2C controllers.
++	 *
++	 * When the chip is in sleep mode the FIRST read causes a NACK
++	 * (the device wakes up but cannot ACK in time).  We therefore
++	 * ignore the result of the first attempt, wait a few milliseconds
++	 * for the chip to fully wake up, and then do a second read that
++	 * must succeed.
+ 	 */
++	i2c_read_dt(&config->bus, &val, 1); /* wakeup pulse – NACK is OK */
++	k_msleep(5);
++
+ 	rc = i2c_read_dt(&config->bus, &val, 1);
+ 	if (rc < 0) {
+ 		LOG_ERR("Failed to go wake-up chip");
